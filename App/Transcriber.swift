@@ -1,0 +1,69 @@
+import Foundation
+import WhisperKit
+
+enum TranscriberError: LocalizedError {
+    case tooShort
+    var errorDescription: String? { "That was too short to transcribe." }
+}
+
+/// Wraps WhisperKit. The model loads once per arm and is released on disarm to keep memory low.
+actor Transcriber {
+    /// Change this one constant to use a different model. Names must match a folder in
+    /// huggingface.co/argmaxinc/whisperkit-coreml (a substring is enough; it is matched as `*name/*`).
+    /// Smaller/faster alternatives: "small", "distil-large-v3_594MB".
+    static let modelName = "large-v3-v20240930_turbo_632MB"
+
+    /// Fewer than ~0.4 s of audio is treated as an accidental tap.
+    static let minSamples = Int(AudioCapture.targetSampleRate * 0.4)
+
+    private var loadTask: Task<WhisperKit, Error>?
+
+    /// Starts loading (downloads the model on first run). Safe to call repeatedly.
+    func load() async throws {
+        _ = try await pipeline()
+    }
+
+    func unload() async {
+        guard let task = loadTask else { return }
+        loadTask = nil
+        task.cancel()                       // abort an in-flight download/load if there is one
+        let pipe = try? await task.value
+        if let pipe { await pipe.unloadModels() }
+    }
+
+    func transcribe(_ samples: [Float]) async throws -> String {
+        guard samples.count >= Self.minSamples else { throw TranscriberError.tooShort }
+        let pipe = try await pipeline()
+        let results = try await pipe.transcribe(audioArray: samples, decodeOptions: DecodingOptions(verbose: false))
+        let raw = results.map(\.text).joined(separator: " ")
+        return TranscriptSanitizer.clean(raw)
+    }
+
+    private func pipeline() async throws -> WhisperKit {
+        if let loadTask { return try await loadTask.value }
+        let task = Task { () throws -> WhisperKit in
+            let config = WhisperKitConfig(model: Self.modelName, verbose: false, prewarm: true, load: true, download: true)
+            return try await WhisperKit(config)
+        }
+        loadTask = task
+        do {
+            return try await task.value
+        } catch {
+            loadTask = nil   // allow a retry after a failed download/load
+            throw error
+        }
+    }
+}
+
+/// Removes Whisper artifacts like "[BLANK_AUDIO]" and "<|endoftext|>" and collapses whitespace.
+/// Parentheses are left alone: a user can legitimately dictate them.
+enum TranscriptSanitizer {
+    static func clean(_ text: String) -> String {
+        var out = text
+        for pattern in [#"\[[^\]]*\]"#, #"<\|[^|]*\|>"#] {
+            out = out.replacingOccurrences(of: pattern, with: " ", options: .regularExpression)
+        }
+        out = out.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
