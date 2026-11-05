@@ -12,31 +12,41 @@ final class KeyboardViewController: UIInputViewController {
 
     private var stateObserver: DarwinNotifier?
     private var resultObserver: DarwinNotifier?
+    private var pollTimer: Timer?
     private var deleteDelay: Timer?
     private var deleteRepeat: Timer?
-    private var heightConstraint: NSLayoutConstraint?
+    private var isVisible = false
 
     // MARK: Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
         buildUI()
-        stateObserver = DarwinNotifier(name: Shared.Note.stateChanged) { [weak self] in self?.refresh() }
+        stateObserver = DarwinNotifier(name: Shared.Note.stateChanged) { [weak self] in
+            self?.refresh()
+            // Cross-process defaults can lag the notification by a moment; a second read settles it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.refresh() }
+        }
         resultObserver = DarwinNotifier(name: Shared.Note.resultReady) { [weak self] in
             self?.insertPendingResult()
-            // Cross-process defaults can lag the notification by a moment; the second pass is idempotent.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.insertPendingResult() }
         }
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        isVisible = true
         refresh()
         insertPendingResult()   // a result may have arrived while this keyboard wasn't visible
+        // Re-check regularly while visible so a killed/disarmed app never leaves a stale "ready" button.
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.refresh() }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        isVisible = false
+        pollTimer?.invalidate(); pollTimer = nil
         stopDeleteRepeat()
     }
 
@@ -79,9 +89,9 @@ final class KeyboardViewController: UIInputViewController {
         bottom.axis = .horizontal
         bottom.spacing = 8
         bottom.distribution = .fill
-        globeButton.widthAnchor.constraint(equalToConstant: 64).isActive = true
-        deleteButton.widthAnchor.constraint(equalToConstant: 64).isActive = true
-        returnButton.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        for key in [globeButton, deleteButton, returnButton] {
+            key.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        }
         bottom.heightAnchor.constraint(equalToConstant: 48).isActive = true
 
         let column = UIStackView(arrangedSubviews: [statusLabel, micButton, bottom])
@@ -102,7 +112,6 @@ final class KeyboardViewController: UIInputViewController {
         let height = view.heightAnchor.constraint(equalToConstant: 280)
         height.priority = .defaultHigh
         height.isActive = true
-        heightConstraint = height
     }
 
     private func style(_ button: UIButton, symbol: String? = nil, title: String? = nil) {
@@ -119,13 +128,33 @@ final class KeyboardViewController: UIInputViewController {
 
     private func refresh() {
         guard hasFullAccess else {
-            micButton.isEnabled = false
-            statusLabel.textColor = .systemRed
-            statusLabel.text = "Turn on Allow Full Access: Settings → General → Keyboard → Keyboards → Dictation."
+            setMic(.off, enabled: false)
+            show("Turn on Allow Full Access: Settings → General → Keyboard → Keyboards → Dictation.", error: true)
             return
         }
-        micButton.isEnabled = true
+        guard Shared.appGroupAvailable else {
+            setMic(.off, enabled: false)
+            show("Setup problem: the App Group isn't available. Reinstall the app with signing set on both targets.", error: true)
+            return
+        }
         let state = current
+        setMic(state, enabled: state != .processing)
+
+        // Any message the app published is shown in every state, including .off (permission denied,
+        // audio stopped, auto-disarmed, model failed...).
+        if let message = Shared.message, !message.isEmpty {
+            show(message, error: false)
+            return
+        }
+        switch state {
+        case .off:        show("Tap the mic. The Dictation app opens; swipe back, then tap again.", error: false)
+        case .armed:      show("Tap to start dictating", error: false)
+        case .recording:  show("Listening… tap to finish", error: false)
+        case .processing: show("Writing…", error: false)
+        }
+    }
+
+    private func setMic(_ state: Shared.State, enabled: Bool) {
         var config = micButton.configuration ?? .filled()
         let symbol: String
         switch state {
@@ -136,19 +165,12 @@ final class KeyboardViewController: UIInputViewController {
         }
         config.image = UIImage(systemName: symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 44, weight: .semibold))
         micButton.configuration = config
-        micButton.isEnabled = state != .processing
+        micButton.isEnabled = enabled
+    }
 
-        statusLabel.textColor = .secondaryLabel
-        if let message = Shared.message, !message.isEmpty, state != .off {
-            statusLabel.text = message
-        } else {
-            switch state {
-            case .off:        statusLabel.text = "Tap the mic. The Dictation app opens; swipe back, then tap again."
-            case .armed:      statusLabel.text = "Tap to start dictating"
-            case .recording:  statusLabel.text = "Listening… tap to finish"
-            case .processing: statusLabel.text = "Writing…"
-            }
-        }
+    private func show(_ text: String, error: Bool) {
+        statusLabel.textColor = error ? .systemRed : .secondaryLabel
+        statusLabel.text = text
     }
 
     // MARK: Actions
@@ -172,26 +194,34 @@ final class KeyboardViewController: UIInputViewController {
         var responder: UIResponder? = self
         while let r = responder {
             if let application = r as? UIApplication {
-                application.open(url, options: [:], completionHandler: nil)
-                statusLabel.text = "Opening Dictation… swipe back when it's ready."
+                show("Opening Dictation… swipe back when it's ready.", error: false)
+                application.open(url, options: [:]) { [weak self] opened in
+                    DispatchQueue.main.async {
+                        if !opened { self?.show(Self.openFailedText, error: true) }
+                    }
+                }
                 return
             }
             responder = r.next
         }
-        statusLabel.textColor = .systemRed
-        statusLabel.text = "Couldn't open the app from here. Open Dictation manually, tap Arm, then come back."
+        show(Self.openFailedText, error: true)
     }
 
+    private static let openFailedText = "Couldn't open the app from here. Open Dictation yourself, tap Arm, then come back."
+
     private func insertPendingResult() {
-        guard hasFullAccess else { return }
+        // Only the keyboard actually on screen may claim a result; a hidden instance would swallow it.
+        guard isVisible, hasFullAccess else { return }
         let d = Shared.defaults
         let id = d.string(forKey: Shared.Key.resultID)
         guard Shared.shouldInsertResult(id: id, consumedID: d.string(forKey: Shared.Key.consumedID),
                                         resultTime: d.double(forKey: Shared.Key.resultTime)),
               let text = d.string(forKey: Shared.Key.resultText), !text.isEmpty
         else { return }
-        d.set(id, forKey: Shared.Key.consumedID)
-        textDocumentProxy.insertText(text + " ")
+        let lead = SmartSpacing.leadingSpace(before: textDocumentProxy.documentContextBeforeInput)
+        textDocumentProxy.insertText(lead + text + " ")
+        d.set(id, forKey: Shared.Key.consumedID)           // mark consumed only after inserting
+        d.removeObject(forKey: Shared.Key.resultText)      // don't leave the dictation on disk
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
@@ -199,12 +229,13 @@ final class KeyboardViewController: UIInputViewController {
     @objc private func returnTapped() { textDocumentProxy.insertText("\n") }
 
     @objc private func deleteDown() {
+        stopDeleteRepeat()   // never stack timers
         textDocumentProxy.deleteBackward()
         deleteDelay = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.deleteRepeat = Timer.scheduledTimer(withTimeInterval: 0.07, repeats: true) { [weak self] _ in
-                    self?.textDocumentProxy.deleteBackward()
-                }
+            guard let self else { return }
+            // Created directly (no async hop), so a release can always cancel it.
+            self.deleteRepeat = Timer.scheduledTimer(withTimeInterval: 0.07, repeats: true) { [weak self] _ in
+                self?.textDocumentProxy.deleteBackward()
             }
         }
     }

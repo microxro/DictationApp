@@ -4,7 +4,6 @@ import UIKit
 struct ContentView: View {
     @EnvironmentObject private var engine: DictationEngine
     @State private var scratch = ""
-    @FocusState private var scratchFocused: Bool
 
     var body: some View {
         ScrollView {
@@ -36,6 +35,18 @@ struct ContentView: View {
         }
     }
 
+    /// "Ready" must not be shown while the speech model is still loading or has failed.
+    private var orbTitle: String {
+        if engine.state == .armed {
+            switch engine.modelStatus {
+            case .loading: return "Loading model…"
+            case .failed: return "Model error"
+            default: break
+            }
+        }
+        return engine.state.title
+    }
+
     private var orb: some View {
         let color = engine.state.color
         return ZStack {
@@ -48,11 +59,11 @@ struct ContentView: View {
                 .symbolEffect(.pulse, isActive: engine.state == .recording || engine.state == .processing)
         }
         .overlay(alignment: .bottom) {
-            Text(engine.state.title).font(.headline).foregroundStyle(color).offset(y: 34)
+            Text(orbTitle).font(.headline).foregroundStyle(color).offset(y: 34)
         }
         .padding(.bottom, 30)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Status: \(engine.state.title)")
+        .accessibilityLabel("Status: \(orbTitle)")
     }
 
     private var armButton: some View {
@@ -123,7 +134,6 @@ struct ContentView: View {
                 .font(.subheadline).foregroundStyle(.secondary)
             TextField("Dictate into this field…", text: $scratch, axis: .vertical)
                 .lineLimit(3...8)
-                .focused($scratchFocused)
                 .padding(14)
                 .background(.background, in: RoundedRectangle(cornerRadius: 14))
         }

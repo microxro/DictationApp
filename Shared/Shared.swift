@@ -8,12 +8,15 @@ enum Shared {
     static let appGroup = "group.com.pranav.dictation"
     static let urlScheme = "dictation"
 
-    /// Shared defaults. Falls back to `.standard` only if the App Group is misconfigured, so the app
-    /// never crashes — but then the keyboard cannot see anything, and the app shows a setup error.
-    static var defaults: UserDefaults { UserDefaults(suiteName: appGroup) ?? .standard }
+    /// Shared defaults, created once. Falls back to `.standard` only if the App Group is misconfigured, so the
+    /// app never crashes — but then the keyboard cannot see anything, and both sides show a setup error.
+    /// (`UserDefaults(suiteName:)` returns non-nil even without the entitlement, so it can't detect that.)
+    static let defaults: UserDefaults = UserDefaults(suiteName: appGroup) ?? .standard
 
-    /// True when the App Group container is actually reachable.
-    static var appGroupAvailable: Bool { UserDefaults(suiteName: appGroup) != nil }
+    /// True only when the App Group container exists, i.e. the entitlement is really granted to this process.
+    static var appGroupAvailable: Bool {
+        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) != nil
+    }
 
     enum Key {
         static let heartbeat = "heartbeat"       // Double, unix time; written by the app every second while armed
@@ -37,8 +40,9 @@ enum Shared {
 
     /// How old a heartbeat may be before the app is considered gone.
     static let heartbeatTimeout: TimeInterval = 3
-    /// A result older than this is never inserted by a keyboard that just appeared.
-    static let resultMaxAge: TimeInterval = 60
+    /// A result older than this is never inserted, and the app erases the stored text after this long
+    /// (dictations can be private; they shouldn't sit in the shared plist).
+    static let resultMaxAge: TimeInterval = 30
 
     // MARK: Pure helpers (unit tested)
 
@@ -68,6 +72,16 @@ enum Shared {
     static var message: String? {
         get { defaults.string(forKey: Key.message) }
         set { defaults.set(newValue, forKey: Key.message) }
+    }
+}
+
+/// Decides whether a space is needed before inserted text so it doesn't glue onto the previous word.
+enum SmartSpacing {
+    static func leadingSpace(before context: String?) -> String {
+        guard let last = context?.last else { return "" }
+        if last.isWhitespace || last.isNewline { return "" }
+        if "([{\u{201C}\u{2018}\"".contains(last) { return "" }
+        return " "
     }
 }
 

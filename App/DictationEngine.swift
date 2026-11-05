@@ -15,7 +15,7 @@ final class DictationEngine: ObservableObject {
     @Published private(set) var lastText = ""
     /// Non-fatal information, e.g. "used raw transcript".
     @Published private(set) var notice: String?
-    /// Something the user needs to act on.
+    /// Something the user needs to act on. Also mirrored to the keyboard's status label.
     @Published private(set) var errorMessage: String?
 
     static let idleTimeout: TimeInterval = 10 * 60
@@ -27,8 +27,9 @@ final class DictationEngine: ObservableObject {
     private var toggleObserver: DarwinNotifier?
     private var tickTimer: Timer?
     private var lastActivity = Date()
+    private var lastDelivery: Date?
+    private var lastAudioRestart = Date.distantPast
     private var isArming = false
-    private var isRestartingAudio = false
     private var modelTask: Task<Void, Never>?
     private var processTask: Task<Void, Never>?
     private var unloadTask: Task<Void, Never>?
@@ -37,13 +38,16 @@ final class DictationEngine: ObservableObject {
     init() {
         Shared.state = .off
         Shared.defaults.set(0.0, forKey: Shared.Key.heartbeat)
+        Shared.defaults.removeObject(forKey: Shared.Key.resultText)
         Shared.message = nil
-        if !Shared.appGroupAvailable {
-            errorMessage = "The App Group \(Shared.appGroup) isn't available. Check signing & capabilities on both targets."
-        }
+        if !Shared.appGroupAvailable { errorMessage = Self.appGroupError }
+        // Darwin callbacks arrive on the main queue (see DarwinNotifier), so this is safe on the main actor.
         toggleObserver = DarwinNotifier(name: Shared.Note.toggle) { [weak self] in self?.handleToggle() }
         observeAudio()
     }
+
+    private static let appGroupError =
+        "The App Group \(Shared.appGroup) isn't available. Check Signing & Capabilities on both targets."
 
     // MARK: - Arm / disarm
 
@@ -57,18 +61,16 @@ final class DictationEngine: ObservableObject {
 
     private func armAsync() async {
         defer { isArming = false }
-        guard Shared.appGroupAvailable else {
-            errorMessage = "The App Group \(Shared.appGroup) isn't available. Check signing & capabilities on both targets."
-            return
-        }
+        guard Shared.appGroupAvailable else { fail(Self.appGroupError); return }
         guard await AVAudioApplication.requestRecordPermission() else {
-            errorMessage = "Microphone access is off. Enable it in Settings → Dictation."
+            fail("Microphone access is off. Enable it in Settings → Dictation.")
             return
         }
         do {
             try capture.startEngine()
         } catch {
-            errorMessage = "Couldn't start the microphone: \(error.localizedDescription)"
+            capture.stopEngine()    // don't leak a half-started session or tap
+            fail("Couldn't start the microphone: \(error.localizedDescription)")
             return
         }
         lastActivity = Date()
@@ -78,20 +80,32 @@ final class DictationEngine: ObservableObject {
     }
 
     func disarm(message: String? = nil) {
-        processTask?.cancel(); processTask = nil
+        let inFlight = processTask
+        inFlight?.cancel(); processTask = nil
         modelTask?.cancel(); modelTask = nil
         tickTimer?.invalidate(); tickTimer = nil
         capture.stopEngine()
+        clearResult()
         Shared.defaults.set(0.0, forKey: Shared.Key.heartbeat)
         modelStatus = .notLoaded
         setState(.off, message: message)
         if let message { notice = message }
+        // Unload only after any in-flight transcription has finished, never mid-inference.
         let transcriber = self.transcriber
-        unloadTask = Task { await transcriber.unload() }
+        unloadTask = Task {
+            await inFlight?.value
+            await transcriber.unload()
+        }
     }
 
     func toggleArmed() {
         state == .off ? arm() : disarm()
+    }
+
+    /// Shows a problem in the app and on the keyboard, even while disarmed.
+    private func fail(_ message: String) {
+        errorMessage = message
+        publishMessage(message)
     }
 
     // MARK: - Model
@@ -143,10 +157,7 @@ final class DictationEngine: ObservableObject {
     }
 
     private func startRecording() {
-        guard capture.isEngineRunning else {
-            restartAudio()
-            return
-        }
+        if !capture.isEngineRunning, !restartAudio() { return }
         errorMessage = nil
         notice = nil
         lastActivity = Date()
@@ -156,12 +167,28 @@ final class DictationEngine: ObservableObject {
 
     private func stopRecording() {
         let samples = capture.endCapture()
+        let conversionFailures = capture.conversionFailures
         lastActivity = Date()
         setState(.processing, message: nil)
-        processTask = Task { [weak self] in await self?.process(samples) }
+        processTask = Task { [weak self] in
+            await self?.process(samples, conversionFailures: conversionFailures)
+        }
     }
 
-    private func process(_ samples: [Float]) async {
+    private func process(_ samples: [Float], conversionFailures: Int) async {
+        if samples.count < Transcriber.minSamples {
+            if conversionFailures > 0 {
+                errorMessage = "Microphone audio couldn't be converted (\(conversionFailures) buffers failed). Try disarming and arming again."
+                finishProcessing(message: "Microphone conversion failed")
+            } else {
+                finishProcessing(message: "Too short — try again")
+            }
+            return
+        }
+        if AudioLevel.isSilent(samples) {
+            finishProcessing(message: "Didn't hear anything")
+            return
+        }
         do {
             let raw = try await transcriber.transcribe(samples)
             try Task.checkCancellation()
@@ -185,6 +212,7 @@ final class DictationEngine: ObservableObject {
         } catch TranscriberError.tooShort {
             finishProcessing(message: "Too short — try again")
         } catch {
+            guard !Task.isCancelled, state == .processing else { return }   // disarmed meanwhile: not a real error
             errorMessage = "Transcription failed: \(error.localizedDescription)"
             finishProcessing(message: "Transcription failed")
         }
@@ -195,16 +223,25 @@ final class DictationEngine: ObservableObject {
         if state == .processing { setState(.armed, message: message) }
     }
 
+    // MARK: - Result delivery
+
     /// Hands the final text to the keyboard via the App Group and wakes it with a Darwin notification.
     private func deliver(_ text: String) {
         let d = Shared.defaults
         d.set(text, forKey: Shared.Key.resultText)
         d.set(Date().timeIntervalSince1970, forKey: Shared.Key.resultTime)
         d.set(UUID().uuidString, forKey: Shared.Key.resultID)
+        lastDelivery = Date()
         DarwinNotifier.post(Shared.Note.resultReady)
     }
 
-    // MARK: - Heartbeat, cap and auto-disarm
+    /// Dictations can be private: don't leave the text in the shared plist.
+    private func clearResult() {
+        Shared.defaults.removeObject(forKey: Shared.Key.resultText)
+        lastDelivery = nil
+    }
+
+    // MARK: - Heartbeat, cap, expiry and auto-disarm
 
     private func startTicking() {
         tickTimer?.invalidate()
@@ -219,7 +256,10 @@ final class DictationEngine: ObservableObject {
     private func tick() {
         guard state != .off else { return }
         publishHeartbeat()
+        if let lastDelivery, Date().timeIntervalSince(lastDelivery) > Shared.resultMaxAge { clearResult() }
         if state == .recording, capture.hitCap { stopRecording() }
+        // A slow first-run model download isn't "idle".
+        if modelStatus == .loading { lastActivity = Date() }
         if state == .armed, Date().timeIntervalSince(lastActivity) > Self.idleTimeout {
             disarm(message: "Disarmed after 10 minutes without dictation.")
         }
@@ -240,7 +280,11 @@ final class DictationEngine: ObservableObject {
         })
         for name in [Notification.Name.AVAudioEngineConfigurationChange, AVAudioSession.mediaServicesWereResetNotification] {
             notificationTokens.append(nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.restartAudio() }
+                MainActor.assumeIsolated {
+                    // Our own restart can itself post a configuration change; don't loop.
+                    guard let self, Date().timeIntervalSince(self.lastAudioRestart) > 1 else { return }
+                    self.restartAudio()
+                }
             })
         }
     }
@@ -260,18 +304,22 @@ final class DictationEngine: ObservableObject {
         }
     }
 
-    /// Rebuilds the engine after an interruption, route change or media-services reset.
-    private func restartAudio() {
-        guard state != .off, !isRestartingAudio else { return }
-        isRestartingAudio = true
-        defer { isRestartingAudio = false }
+    /// Rebuilds the engine (keeping the session active). Returns false if it failed, in which case the app disarmed.
+    @discardableResult
+    private func restartAudio() -> Bool {
+        guard state != .off else { return false }
+        lastAudioRestart = Date()
         let wasRecording = state == .recording
-        capture.stopEngine()
         do {
-            try capture.startEngine()
-            if wasRecording { setState(.armed, message: "Recording interrupted") }
+            try capture.restartEngine()
+            if wasRecording {
+                _ = capture.endCapture()
+                setState(.armed, message: "Recording interrupted")
+            }
+            return true
         } catch {
             disarm(message: "Audio stopped: \(error.localizedDescription)")
+            return false
         }
     }
 

@@ -68,7 +68,7 @@ targets:
           NSExtensionPointIdentifier: com.apple.keyboard-service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).KeyboardViewController
           NSExtensionAttributes:
-            IsASCIICapable: false
+            IsASCIICapable: true     # lets the keyboard be offered in email/URL fields
             PrimaryLanguage: en-US
             RequestsOpenAccess: true
   DictationTests:

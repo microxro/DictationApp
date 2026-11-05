@@ -49,7 +49,7 @@ actor Transcriber {
         do {
             return try await task.value
         } catch {
-            loadTask = nil   // allow a retry after a failed download/load
+            if loadTask == task { loadTask = nil }   // allow a retry; never wipe a newer load's task
             throw error
         }
     }
