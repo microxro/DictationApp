@@ -53,15 +53,18 @@ swipe back and tap again. After that it's instant until the app disarms.
 - Transcription is set to English. For other languages, change `DecodingOptions` in `Transcriber.swift`.
 - The iPad's own microphone is used, not a Bluetooth headset mic: enabling the headset mic while armed would drop
   AirPods into low-quality call audio. Music over A2DP keeps playing at full quality.
-- Cleanup is best-effort. A guard rejects output that doesn't resemble what you said (refusals, long answers) and
-  inserts the raw transcript instead, but a short one-word answer to a spoken question could still slip through.
+- Cleanup is best-effort and errs toward the raw transcript. The model is told to only clean, and a guard rejects any
+  output containing words you didn't say (answers, refusals), after expanding contractions like "I'm"/"gonna". A
+  harmless rewording ("ok" → "okay") therefore falls back to the raw text, with a notice. It can't be perfect.
+- The first dictation after arming waits for the speech model; taps are declined with a message until it's ready.
 - Dictated text sits in the App Group plist only until it is inserted (or 30 s). Darwin notification names are
   unauthenticated, so another app on the device could trigger a recording; the orange mic dot would show.
 
 ## Configuration
 
 - Model: `Transcriber.modelName` (one constant). Smaller/faster: `"small"` or `"distil-large-v3_594MB"`.
-- Idle timeout: `DictationEngine.idleTimeout`.
+- Idle timeout: `DictationEngine.idleTimeout` (messages and help text follow it).
+- WhisperKit is pinned to exactly 1.1.1 in `project.yml`; its API was checked against that tag's source.
 
 ## What to verify first
 
@@ -69,7 +72,11 @@ swipe back and tap again. After that it's instant until the app disarms.
 2. **Arm and record in the app itself** using the "Try it here" field: arm, switch to the Dictation keyboard, tap mic, speak, tap again. Text should appear.
 3. **Background:** arm, switch to Notes, use the keyboard there. If the first tap always bounces you to the app, the
    audio session isn't surviving in the background (check the `audio` background mode and the orange dot).
-4. **Failure messages:** deny mic permission, then tap the keyboard mic. The keyboard's status label should say why.
-5. **Unverified API assumptions** (written from source/memory, never compiled): `LanguageModelSession(instructions:)` +
+4. **Background inference:** with the app in the background, dictate and check the text still appears. The mel model is
+   forced to CPU because iOS forbids GPU work in the background; if you still see "Transcription failed" only when
+   backgrounded, that is the first place to look. Foundation Models cleanup in the background is also unverified
+   (it falls back to the raw transcript if it fails).
+5. **Failure messages:** deny mic permission, then tap the keyboard mic. The keyboard's status label should say why.
+6. **Unverified API assumptions** (written from source/memory, never compiled): `LanguageModelSession(instructions:)` +
    `respond(to:).content`, `SystemLanguageModel.default.availability`, `UIApplication.open` reached through the
    responder chain from the extension, and the Darwin-notification cross-process timing.

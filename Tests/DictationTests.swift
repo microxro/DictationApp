@@ -29,7 +29,9 @@ final class SharedLogicTests: XCTestCase {
         XCTAssertEqual(SmartSpacing.leadingSpace(before: "hello "), "")
         XCTAssertEqual(SmartSpacing.leadingSpace(before: "line\n"), "")
         XCTAssertEqual(SmartSpacing.leadingSpace(before: "("), "")
-        XCTAssertEqual(SmartSpacing.leadingSpace(before: "say \""), "")
+        XCTAssertEqual(SmartSpacing.leadingSpace(before: "say \""), "")             // just opened a quote
+        XCTAssertEqual(SmartSpacing.leadingSpace(before: "He said \"hello\""), " ")  // closed a quote
+        XCTAssertEqual(SmartSpacing.leadingSpace(before: "He said \u{201C}hi\u{201D}"), " ")
     }
 }
 
@@ -74,6 +76,25 @@ final class CleanerTests: XCTestCase {
         let result = await cleaner.clean("what is the capital of france")
         XCTAssertEqual(result.text, "what is the capital of france")
         XCTAssertNotNil(result.fallbackReason)
+    }
+
+    func testFallsBackWhenModelGivesShortAnswer() async {
+        let cleaner = Cleaner(backend: { _ in "The capital of France is Paris." })
+        let result = await cleaner.clean("what is the capital of france")
+        XCTAssertEqual(result.text, "what is the capital of france", "a one-word answer must not be inserted")
+        XCTAssertNotNil(result.fallbackReason)
+    }
+
+    func testCurlyApostropheContractionsAreAccepted() async {
+        let cleaner = Cleaner(backend: { _ in "I don\u{2019}t know what I\u{2019}m doing." })
+        let result = await cleaner.clean("i don't know what i'm doing")
+        XCTAssertNil(result.fallbackReason)
+        XCTAssertEqual(result.text, "I don\u{2019}t know what I\u{2019}m doing.")
+    }
+
+    func testWordNormalization() {
+        XCTAssertEqual(Cleaner.words("I'm gonna go"), ["i", "am", "going", "to", "go"])
+        XCTAssertEqual(Cleaner.words("don\u{2019}t Can't it's John's"), ["do", "not", "can", "not", "it", "is", "john"])
     }
 
     func testFallsBackWhenModelAnswersAtLength() async {

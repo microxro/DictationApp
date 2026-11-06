@@ -140,14 +140,18 @@ final class KeyboardViewController: UIInputViewController {
         let state = current
         setMic(state, enabled: state != .processing)
 
-        // Any message the app published is shown in every state, including .off (permission denied,
-        // audio stopped, auto-disarmed, model failed...).
-        if let message = Shared.message, !message.isEmpty {
+        // If the stored state says armed/recording but the heartbeat is gone, the app was killed and its last
+        // message is stale. A clean exit leaves state .off, and then its message (permission denied, audio
+        // stopped, auto-disarmed...) is still true and is shown.
+        let appDied = !Shared.appIsArmed && Shared.state != .off
+        if !appDied, let message = Shared.message, !message.isEmpty {
             show(message, error: false)
             return
         }
         switch state {
-        case .off:        show("Tap the mic. The Dictation app opens; swipe back, then tap again.", error: false)
+        case .off:
+            show(appDied ? "The Dictation app stopped. Tap the mic to reopen it."
+                         : "Tap the mic. The Dictation app opens; swipe back, then tap again.", error: false)
         case .armed:      show("Tap to start dictating", error: false)
         case .recording:  show("Listening… tap to finish", error: false)
         case .processing: show("Writing…", error: false)

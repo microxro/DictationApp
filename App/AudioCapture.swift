@@ -48,7 +48,7 @@ final class AudioCapture: @unchecked Sendable {
         engine.stop()
         engine = AVAudioEngine()
         try configureSession(activate: false)
-        try? AVAudioSession.sharedInstance().setActive(true)
+        try AVAudioSession.sharedInstance().setActive(true)   // surface the real cause if the session is still held
         try buildAndStart()
     }
 
@@ -56,6 +56,7 @@ final class AudioCapture: @unchecked Sendable {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         lock.lock(); capturing = false; samples.removeAll(keepingCapacity: false); lock.unlock()
+        // Deactivation fails only if another client still uses audio; nothing the user can act on, so it is ignored on purpose.
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 

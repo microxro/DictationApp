@@ -78,9 +78,11 @@ enum Shared {
 /// Decides whether a space is needed before inserted text so it doesn't glue onto the previous word.
 enum SmartSpacing {
     static func leadingSpace(before context: String?) -> String {
-        guard let last = context?.last else { return "" }
+        guard let context, let last = context.last else { return "" }
         if last.isWhitespace || last.isNewline { return "" }
-        if "([{\u{201C}\u{2018}\"".contains(last) { return "" }
+        if "([{\u{201C}\u{2018}".contains(last) { return "" }
+        // A straight quote is ambiguous: an odd count means we are inside a quotation (it just opened).
+        if last == "\"" { return context.filter { $0 == "\"" }.count % 2 == 1 ? "" : " " }
         return " "
     }
 }

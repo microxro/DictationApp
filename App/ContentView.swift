@@ -146,7 +146,7 @@ struct ContentView: View {
                 Text("2. Tap Dictation in that list and turn on **Allow Full Access**. It's required to talk to this app. Nothing leaves your iPad.")
                 Text("3. In any text field, hold 🌐 and choose Dictation. Tap the mic.")
                 Text("4. If the app isn't armed, the first tap opens it. Swipe back, then tap the mic again.")
-                Text("The orange mic dot stays on while armed. Disarm here, or wait 10 idle minutes.")
+                Text("The orange mic dot stays on while armed. Disarm here, or wait \(DictationEngine.idleMinutes) idle minutes.")
                     .foregroundStyle(.secondary)
             }
             .font(.subheadline)

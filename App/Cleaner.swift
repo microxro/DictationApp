@@ -70,24 +70,56 @@ struct Cleaner {
     }
 
     /// Heuristic guard against a model that answers, refuses or rambles instead of cleaning.
-    /// Cleaning mostly reuses the speaker's words, so output dominated by words they never said is rejected.
-    /// Known limit: a very short answer that reuses the question's words (one new word) can still pass;
-    /// the delimited prompt and instructions are the primary defence, this is the backstop.
+    /// Cleaning reuses the speaker's words, so output containing words they never said is rejected.
+    /// Contractions and colloquialisms are expanded on both sides first ("gonna" == "going to", "I'm" == "I am",
+    /// curly and straight apostrophes alike), so ordinary grammar cleanup doesn't count as "new" words.
+    /// Short outputs get NO allowance for new words: a one-word answer ("...is Paris.") must not pass.
+    /// The price is that a harmless rewording ("ok" -> "okay") falls back to the raw transcript, which is
+    /// the safe direction: raw text is never wrong, an inserted answer is. The delimited prompt is the primary
+    /// defence; this is the backstop and cannot be perfect.
     static func isFaithful(raw: String, cleaned: String) -> Bool {
         let rawWords = words(raw), cleanedWords = words(cleaned)
         guard !rawWords.isEmpty, !cleanedWords.isEmpty else { return false }
         let rawSet = Set(rawWords), cleanedSet = Set(cleanedWords)
         let novel = cleanedWords.filter { !rawSet.contains($0) }.count
-        guard Double(novel) <= max(3, 0.3 * Double(cleanedWords.count)) else { return false }
+        guard novel <= Int(0.15 * Double(cleanedWords.count)) else { return false }
         // Fillers and self-corrections legitimately drop many words, so this floor is low.
         let kept = rawWords.filter { cleanedSet.contains($0) }.count
         return Double(kept) / Double(rawWords.count) >= 0.2
     }
 
-    private static func words(_ text: String) -> [String] {
-        text.lowercased()
-            .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" })
-            .map(String.init)
+    static func words(_ text: String) -> [String] {
+        let folded = text.lowercased().replacingOccurrences(of: "\u{2019}", with: "'")
+        var out: [String] = []
+        for piece in folded.split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" }) {
+            let token = String(piece).trimmingCharacters(in: CharacterSet(charactersIn: "'"))
+            if !token.isEmpty { out.append(contentsOf: expand(token)) }
+        }
+        return out
+    }
+
+    private static let colloquial: [String: [String]] = [
+        "gonna": ["going", "to"], "wanna": ["want", "to"], "gotta": ["got", "to"],
+        "kinda": ["kind", "of"], "sorta": ["sort", "of"], "lemme": ["let", "me"], "gimme": ["give", "me"],
+        "can't": ["can", "not"], "won't": ["will", "not"], "let's": ["let", "us"],
+    ]
+    private static let contractionSuffixes: [(String, String)] = [
+        ("'re", "are"), ("'ve", "have"), ("'ll", "will"), ("'d", "would"), ("'m", "am"),
+    ]
+    /// Stems where "'s" means "is" (otherwise it is a possessive and is dropped).
+    private static let isStems: Set<String> = ["it", "he", "she", "that", "there", "here", "what", "who", "where", "how", "when", "why"]
+
+    private static func expand(_ token: String) -> [String] {
+        if let words = colloquial[token] { return words }
+        if token.hasSuffix("n't") { return [String(token.dropLast(3)), "not"] }
+        for (suffix, full) in contractionSuffixes where token.hasSuffix(suffix) {
+            return [String(token.dropLast(suffix.count)), full]
+        }
+        if token.hasSuffix("'s") {
+            let stem = String(token.dropLast(2))
+            return isStems.contains(stem) ? [stem, "is"] : [stem]
+        }
+        return [token]
     }
 }
 

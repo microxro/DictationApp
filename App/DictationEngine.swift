@@ -19,6 +19,9 @@ final class DictationEngine: ObservableObject {
     @Published private(set) var errorMessage: String?
 
     static let idleTimeout: TimeInterval = 10 * 60
+    static var idleMinutes: Int { Int(idleTimeout / 60) }
+    /// If transcription + cleanup takes longer than this, stop waiting and give the keyboard back.
+    static let processingTimeout: TimeInterval = 120
 
     private let capture = AudioCapture()
     private let transcriber = Transcriber()
@@ -28,8 +31,12 @@ final class DictationEngine: ObservableObject {
     private var tickTimer: Timer?
     private var lastActivity = Date()
     private var lastDelivery: Date?
+    private var lastDeliveredID: String?
+    private var processingStarted: Date?
     private var lastAudioRestart = Date.distantPast
     private var isArming = false
+    /// Bumped whenever in-flight processing is abandoned (new recording, timeout, disarm) so stale work is ignored.
+    private var generation = 0
     private var modelTask: Task<Void, Never>?
     private var processTask: Task<Void, Never>?
     private var unloadTask: Task<Void, Never>?
@@ -80,19 +87,26 @@ final class DictationEngine: ObservableObject {
     }
 
     func disarm(message: String? = nil) {
+        generation += 1                                   // anything still running must not deliver
         let inFlight = processTask
         inFlight?.cancel(); processTask = nil
-        modelTask?.cancel(); modelTask = nil
+        let loading = modelTask
+        loading?.cancel(); modelTask = nil
         tickTimer?.invalidate(); tickTimer = nil
         capture.stopEngine()
         clearResult()
         Shared.defaults.set(0.0, forKey: Shared.Key.heartbeat)
         modelStatus = .notLoaded
+        processingStarted = nil
         setState(.off, message: message)
         if let message { notice = message }
-        // Unload only after any in-flight transcription has finished, never mid-inference.
+        // Unload only after the previous unload, any model load and any transcription have all finished:
+        // never mid-inference, and never leaving a model that a cancelled load finished loading afterwards.
+        let previousUnload = unloadTask
         let transcriber = self.transcriber
         unloadTask = Task {
+            await previousUnload?.value
+            await loading?.value
             await inFlight?.value
             await transcriber.unload()
         }
@@ -124,6 +138,7 @@ final class DictationEngine: ObservableObject {
         let pendingUnload = unloadTask
         modelTask = Task { [weak self] in
             await pendingUnload?.value          // never load while the previous unload is still running
+            guard !Task.isCancelled else { return }   // disarmed again while waiting: don't load a model nobody will unload
             do {
                 try await transcriber.load()
                 guard !Task.isCancelled else { return }
@@ -157,6 +172,18 @@ final class DictationEngine: ObservableObject {
     }
 
     private func startRecording() {
+        // Recording before the model is ready only leads to a long, silent wait afterwards.
+        switch modelStatus {
+        case .ready:
+            break
+        case .loading, .notLoaded:
+            publishMessage("Still loading the speech model — try again shortly")
+            return
+        case .failed:
+            publishMessage("Model failed — retrying. Try again in a moment.")
+            retryModel()
+            return
+        }
         if !capture.isEngineRunning, !restartAudio() { return }
         errorMessage = nil
         notice = nil
@@ -169,58 +196,67 @@ final class DictationEngine: ObservableObject {
         let samples = capture.endCapture()
         let conversionFailures = capture.conversionFailures
         lastActivity = Date()
+        processingStarted = Date()
+        generation += 1
+        let id = generation
         setState(.processing, message: nil)
+        // Serialised: a previous (timed-out) job may still be running inside WhisperKit; never run two at once.
+        let previous = processTask
         processTask = Task { [weak self] in
-            await self?.process(samples, conversionFailures: conversionFailures)
+            await previous?.value
+            await self?.process(samples, conversionFailures: conversionFailures, id: id)
         }
     }
 
-    private func process(_ samples: [Float], conversionFailures: Int) async {
+    private func process(_ samples: [Float], conversionFailures: Int, id: Int) async {
+        guard id == generation else { return }
         if samples.count < Transcriber.minSamples {
             if conversionFailures > 0 {
                 errorMessage = "Microphone audio couldn't be converted (\(conversionFailures) buffers failed). Try disarming and arming again."
-                finishProcessing(message: "Microphone conversion failed")
+                finishProcessing(id: id, message: "Microphone conversion failed")
             } else {
-                finishProcessing(message: "Too short — try again")
+                finishProcessing(id: id, message: "Too short — try again")
             }
             return
         }
         if AudioLevel.isSilent(samples) {
-            finishProcessing(message: "Didn't hear anything")
+            finishProcessing(id: id, message: "Didn't hear anything")
             return
         }
         do {
             let raw = try await transcriber.transcribe(samples)
-            try Task.checkCancellation()
+            guard id == generation else { return }
             guard !raw.isEmpty else {
-                finishProcessing(message: "Didn't catch anything")
+                finishProcessing(id: id, message: "Didn't catch anything")
                 return
             }
-            let result = await cleaner.clean(raw)
-            try Task.checkCancellation()
-            guard !result.text.isEmpty else {
-                finishProcessing(message: "Didn't catch anything")
-                return
+            let result = await cleaner.clean(raw)       // non-empty input always yields non-empty text
+            guard id == generation else { return }
+
+            var notes: [String] = []
+            if let reason = result.fallbackReason { notes.append("Inserted the raw transcript (\(reason)).") }
+            if conversionFailures > 0 {
+                notes.append("Some audio was dropped (\(conversionFailures) buffers), so the text may have gaps.")
             }
             lastText = result.text
-            notice = result.fallbackReason.map { "Inserted the raw transcript (\($0))." }
+            notice = notes.isEmpty ? nil : notes.joined(separator: " ")
             modelStatus = .ready
             deliver(result.text)
-            finishProcessing(message: nil)
+            finishProcessing(id: id, message: nil)
         } catch is CancellationError {
-            // disarm() already reset everything
-        } catch TranscriberError.tooShort {
-            finishProcessing(message: "Too short — try again")
+            // abandoned by disarm() or the processing timeout
         } catch {
-            guard !Task.isCancelled, state == .processing else { return }   // disarmed meanwhile: not a real error
+            guard id == generation else { return }      // abandoned meanwhile: not a real error
             errorMessage = "Transcription failed: \(error.localizedDescription)"
-            finishProcessing(message: "Transcription failed")
+            finishProcessing(id: id, message: "Transcription failed")
         }
     }
 
-    private func finishProcessing(message: String?) {
+    private func finishProcessing(id: Int, message: String?) {
+        guard id == generation, state == .processing else { return }
         lastActivity = Date()
-        if state == .processing { setState(.armed, message: message) }
+        processingStarted = nil
+        setState(.armed, message: message)
     }
 
     // MARK: - Result delivery
@@ -228,10 +264,12 @@ final class DictationEngine: ObservableObject {
     /// Hands the final text to the keyboard via the App Group and wakes it with a Darwin notification.
     private func deliver(_ text: String) {
         let d = Shared.defaults
+        let id = UUID().uuidString
         d.set(text, forKey: Shared.Key.resultText)
         d.set(Date().timeIntervalSince1970, forKey: Shared.Key.resultTime)
-        d.set(UUID().uuidString, forKey: Shared.Key.resultID)
+        d.set(id, forKey: Shared.Key.resultID)
         lastDelivery = Date()
+        lastDeliveredID = id
         DarwinNotifier.post(Shared.Note.resultReady)
     }
 
@@ -239,9 +277,10 @@ final class DictationEngine: ObservableObject {
     private func clearResult() {
         Shared.defaults.removeObject(forKey: Shared.Key.resultText)
         lastDelivery = nil
+        lastDeliveredID = nil
     }
 
-    // MARK: - Heartbeat, cap, expiry and auto-disarm
+    // MARK: - Heartbeat, cap, expiry, timeouts and auto-disarm
 
     private func startTicking() {
         tickTimer?.invalidate()
@@ -256,12 +295,27 @@ final class DictationEngine: ObservableObject {
     private func tick() {
         guard state != .off else { return }
         publishHeartbeat()
-        if let lastDelivery, Date().timeIntervalSince(lastDelivery) > Shared.resultMaxAge { clearResult() }
+
+        if let lastDelivery, Date().timeIntervalSince(lastDelivery) > Shared.resultMaxAge {
+            // The keyboard writes consumedID when it inserts. If it never did, tell the user instead of failing silently.
+            if Shared.defaults.string(forKey: Shared.Key.consumedID) != lastDeliveredID {
+                notice = "Your last dictation wasn't inserted because no Dictation keyboard was open. It's under Last dictation: tap Copy."
+            }
+            clearResult()
+        }
         if state == .recording, capture.hitCap { stopRecording() }
+        if state == .processing, let started = processingStarted,
+           Date().timeIntervalSince(started) > Self.processingTimeout {
+            generation += 1                      // whatever is still running must not deliver
+            processTask?.cancel()
+            processingStarted = nil
+            errorMessage = "Transcription took longer than \(Int(Self.processingTimeout)) seconds and was stopped."
+            setState(.armed, message: "Transcription timed out")
+        }
         // A slow first-run model download isn't "idle".
         if modelStatus == .loading { lastActivity = Date() }
         if state == .armed, Date().timeIntervalSince(lastActivity) > Self.idleTimeout {
-            disarm(message: "Disarmed after 10 minutes without dictation.")
+            disarm(message: "Disarmed after \(Self.idleMinutes) minutes without dictation.")
         }
     }
 
