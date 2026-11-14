@@ -1,0 +1,83 @@
+name: Dictation
+options:
+  bundleIdPrefix: com.pranav
+  deploymentTarget:
+    iOS: "26.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "2"      # iPad only
+    DEVELOPMENT_TEAM: ""             # set your team in Xcode (Signing & Capabilities), or here
+    CODE_SIGN_STYLE: Automatic
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit
+    exactVersion: 1.1.1      # API verified against this tag's source; bump deliberately
+targets:
+  Dictation:
+    type: application
+    platform: iOS
+    sources: [Shared, App]
+    dependencies:
+      - package: WhisperKit
+      - target: DictationKeyboard
+    scheme:
+      testTargets: [DictationTests]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pranav.dictation
+    entitlements:
+      path: App/Dictation.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.pranav.dictation]
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Dictation
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UIBackgroundModes: [audio]
+        ITSAppUsesNonExemptEncryption: false
+        NSMicrophoneUsageDescription: Dictation records your voice to turn it into text, on this device only.
+        CFBundleURLTypes:
+          - CFBundleURLName: com.pranav.dictation
+            CFBundleURLSchemes: [dictation]
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+  DictationKeyboard:
+    type: app-extension
+    platform: iOS
+    sources: [Shared, Keyboard]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pranav.dictation.keyboard
+        APPLICATION_EXTENSION_API_ONLY: NO   # needed for the responder-chain URL open
+    entitlements:
+      path: Keyboard/DictationKeyboard.entitlements
+      properties:
+        com.apple.security.application-groups: [group.com.pranav.dictation]
+    info:
+      path: Keyboard/Info.plist
+      properties:
+        CFBundleDisplayName: Dictation
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.keyboard-service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).KeyboardViewController
+          NSExtensionAttributes:
+            IsASCIICapable: true     # lets the keyboard be offered in email/URL fields
+            PrimaryLanguage: en-US
+            RequestsOpenAccess: true
+  DictationTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Tests]
+    dependencies:
+      - target: Dictation
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pranav.dictation.tests
+        GENERATE_INFOPLIST_FILE: YES
